@@ -2,6 +2,8 @@
 
 # WIns Delivery
 
+**Live demo: https://winsksa.github.io/wins-delivery/**
+
 A delivery app in the style of Amazon and noon, in **Arabic and English**. The customer's location decides which delivery zone they are in and which store serves them. The app then shows only that store's products and stock.
 
 ## Features
