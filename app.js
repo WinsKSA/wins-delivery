@@ -83,6 +83,16 @@ const CAT = {
 };
 const catIcon = c => `<svg viewBox="0 0 24 24" aria-hidden="true">${(CAT[c] || CAT.Pantry).icon}</svg>`;
 const tileStyle = c => { const h = (CAT[c] || CAT.Pantry).hue; return `background:color-mix(in srgb, ${h} 15%, var(--surface));color:${h}`; };
+// Product photos (generated in Figma). Each photo is used only on the products it shows;
+// everything else keeps its category icon tile.
+const PHOTOS = {
+  p01: 'fresh', p02: 'fresh', p06: 'pantry', p09: 'pantry', p13: 'beverages',
+  p15: 'electronics', p16: 'electronics', p20: 'home', p21: 'home', p22: 'beauty', p23: 'beauty',
+};
+const thumb = p => PHOTOS[p.id]
+  ? `<img src="assets/products/${PHOTOS[p.id]}.jpg" alt="" loading="lazy" decoding="async">`
+  : catIcon(p.category);
+const thumbClass = p => (PHOTOS[p.id] ? ' has-photo' : '');
 
 /* ---------------- demo data (Riyadh) ---------------- */
 function seed() {
@@ -355,7 +365,7 @@ function productCard(p, storeId) {
     : qty ? `<div class="stepper"><button data-action="dec" data-id="${p.id}" aria-label="${t('removeOne')}">−</button><span>${qty}</span><button data-action="inc" data-id="${p.id}" aria-label="${t('addOne')}">+</button></div>`
     : `<button class="add-btn" data-action="inc" data-id="${p.id}">${t('add')}</button>`;
   return `<article class="card ${out ? 'is-out' : ''}">
-    <div class="tile" style="${tileStyle(p.category)}">${badge}${catIcon(p.category)}</div>
+    <div class="tile${thumbClass(p)}" style="${tileStyle(p.category)}">${badge}${thumb(p)}</div>
     <div class="card-body"><span class="name">${esc(nm(p))}</span><span class="unit">${esc(nm(p, 'unit'))}</span></div>
     <div class="card-foot">${priceHtml(p)}${ctrl}</div>
   </article>`;
@@ -432,7 +442,7 @@ function renderCart() {
       ${from}
       ${unavailable.length ? `<div class="notice">${t('unavailableN', { n: unavailable.length })}</div>` : ''}
       ${tt.lines.map(l => `<div class="line-item ${l.available ? '' : 'unavailable'}">
-        <div class="mini" style="${tileStyle(l.p.category)}">${catIcon(l.p.category)}</div>
+        <div class="mini${thumbClass(l.p)}" style="${tileStyle(l.p.category)}">${thumb(l.p)}</div>
         <div><b>${esc(nm(l.p))}</b><div class="muted small">${esc(nm(l.p, 'unit'))} · ${money(l.p.price)}${l.available ? '' : ` · <span style="color:var(--danger)">${l.stock ? t('onlyNInStock', { n: l.stock }) : t('notHere')}</span>`}</div></div>
         <div class="stepper"><button data-action="dec" data-id="${l.p.id}" aria-label="${t('removeOne')}">−</button><span>${l.qty}</span><button data-action="inc" data-id="${l.p.id}" aria-label="${t('addOne')}">+</button></div>
       </div>`).join('')}
@@ -863,7 +873,7 @@ function adminProducts() {
     <div class="table-wrap"><table>
       <thead><tr><th>${t('product')}</th><th>${t('listed')}</th><th class="n">${t('price')}</th>${S.stores.map(s => `<th class="n" title="${esc(nm(s))}">${esc(shortStore(s))}</th>`).join('')}<th></th></tr></thead>
       <tbody>${S.products.map(p => `<tr>
-        <td><div class="prod-cell"><span class="mini" style="${tileStyle(p.category)}">${catIcon(p.category)}</span><div><b>${esc(nm(p))}</b><div class="small muted">${catLabel(p.category)} · ${esc(nm(p, 'unit'))}</div></div></div></td>
+        <td><div class="prod-cell"><span class="mini${thumbClass(p)}" style="${tileStyle(p.category)}">${thumb(p)}</span><div><b>${esc(nm(p))}</b><div class="small muted">${catLabel(p.category)} · ${esc(nm(p, 'unit'))}</div></div></div></td>
         <td><input type="checkbox" data-listed="${p.id}" ${p.listed !== false ? 'checked' : ''} aria-label="${t('listed')}"></td>
         <td class="n"><input class="stock-in" type="number" min="0" step="0.5" data-price="${p.id}" value="${p.price}" aria-label="${t('price')}"></td>
         ${S.stores.map(s => { const q = stockOf(s.id, p.id); return `<td class="n"><input class="stock-in ${q === 0 ? 'zero' : q === undefined ? 'na' : ''}" type="number" min="0" placeholder="—" data-stock="${s.id}|${p.id}" value="${q ?? ''}" aria-label="${esc(t('stockAt', { s: nm(s) }))}"></td>`; }).join('')}
