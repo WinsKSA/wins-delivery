@@ -1,0 +1,44 @@
+{
+  "categories": [
+    { "key": "Cheesecake", "en": "Cheesecakes", "ar": "تشيز كيك", "hue": "#C2456B", "ageRestricted": false },
+    { "key": "Shisha", "en": "Shisha", "ar": "شيشة", "hue": "#5B6C8F", "ageRestricted": true },
+    { "key": "Tea", "en": "Tea", "ar": "شاي", "hue": "#B5651D", "ageRestricted": false }
+  ],
+  "products": [
+    { "id": "ck01", "category": "Cheesecake", "name": "Strawberry Cheesecake", "nameAr": "تشيز كيك الفراولة", "unit": "1 slice", "unitAr": "شريحة", "price": 24 },
+    { "id": "ck02", "category": "Cheesecake", "name": "Blueberry Cheesecake", "nameAr": "تشيز كيك التوت الأزرق", "unit": "1 slice", "unitAr": "شريحة", "price": 24 },
+    { "id": "ck03", "category": "Cheesecake", "name": "Mango Cheesecake", "nameAr": "تشيز كيك المانجو", "unit": "1 slice", "unitAr": "شريحة", "price": 25 },
+    { "id": "ck04", "category": "Cheesecake", "name": "Raspberry Cheesecake", "nameAr": "تشيز كيك التوت الأحمر", "unit": "1 slice", "unitAr": "شريحة", "price": 25 },
+    { "id": "ck05", "category": "Cheesecake", "name": "Passion Fruit Cheesecake", "nameAr": "تشيز كيك الباشن فروت", "unit": "1 slice", "unitAr": "شريحة", "price": 26 },
+    { "id": "ck06", "category": "Cheesecake", "name": "Pomegranate Cheesecake", "nameAr": "تشيز كيك الرمان", "unit": "1 slice", "unitAr": "شريحة", "price": 26 },
+    { "id": "ck07", "category": "Cheesecake", "name": "Fig & Honey Cheesecake", "nameAr": "تشيز كيك التين والعسل", "unit": "1 slice", "unitAr": "شريحة", "price": 27 },
+    { "id": "ck08", "category": "Cheesecake", "name": "Mixed Berries Cheesecake", "nameAr": "تشيز كيك التوت المشكل", "unit": "Whole cake, 8 inch", "unitAr": "كاملة، 8 إنش", "price": 149, "was": 169 },
+
+    { "id": "sh01", "category": "Shisha", "name": "Double Apple Shisha", "nameAr": "شيشة تفاحتين", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh02", "category": "Shisha", "name": "Grape & Mint Shisha", "nameAr": "شيشة عنب ونعناع", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh03", "category": "Shisha", "name": "Lemon & Mint Shisha", "nameAr": "شيشة ليمون ونعناع", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh04", "category": "Shisha", "name": "Watermelon & Mint Shisha", "nameAr": "شيشة بطيخ ونعناع", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh05", "category": "Shisha", "name": "Blueberry Shisha", "nameAr": "شيشة توت", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh06", "category": "Shisha", "name": "Mastic Gum & Mint Shisha", "nameAr": "شيشة مستكة ونعناع", "unit": "Arabic, 1 head", "unitAr": "عربي، رأس واحد", "price": 45 },
+    { "id": "sh07", "category": "Shisha", "name": "Extra Head", "nameAr": "رأس إضافي", "unit": "Any flavor", "unitAr": "أي نكهة", "price": 30 },
+    { "id": "sh08", "category": "Shisha", "name": "Natural Coconut Charcoal", "nameAr": "فحم جوز الهند الطبيعي", "unit": "1 kg", "unitAr": "1 كجم", "price": 25 },
+    { "id": "sh09", "category": "Shisha", "name": "Arabic Hookah, Full Set", "nameAr": "شيشة عربية، طقم كامل", "unit": "1 set", "unitAr": "طقم", "price": 220, "was": 260 },
+
+    { "id": "te01", "category": "Tea", "name": "Karak Tea", "nameAr": "شاي كرك", "unit": "1 cup", "unitAr": "كوب", "price": 8 },
+    { "id": "te02", "category": "Tea", "name": "Adeni Tea", "nameAr": "شاي عدني", "unit": "1 cup", "unitAr": "كوب", "price": 9 },
+    { "id": "te03", "category": "Tea", "name": "Red Tea with Mint", "nameAr": "شاي أحمر بالنعناع", "unit": "1 pot", "unitAr": "براد", "price": 15 },
+    { "id": "te04", "category": "Tea", "name": "Moroccan Mint Tea", "nameAr": "شاي مغربي بالنعناع", "unit": "1 pot", "unitAr": "براد", "price": 18 },
+    { "id": "te05", "category": "Tea", "name": "Green Tea", "nameAr": "شاي أخضر", "unit": "1 cup", "unitAr": "كوب", "price": 10 },
+    { "id": "te06", "category": "Tea", "name": "Saffron Tea", "nameAr": "شاي بالزعفران", "unit": "1 cup", "unitAr": "كوب", "price": 14 },
+    { "id": "te07", "category": "Tea", "name": "Ginger & Lemon Tea", "nameAr": "شاي زنجبيل وليمون", "unit": "1 cup", "unitAr": "كوب", "price": 11 },
+    { "id": "te08", "category": "Tea", "name": "Masala Chai", "nameAr": "شاي ماسالا", "unit": "1 cup", "unitAr": "كوب", "price": 10 },
+    { "id": "te09", "category": "Tea", "name": "Iced Hibiscus (Karkade)", "nameAr": "كركديه بارد", "unit": "1 cup", "unitAr": "كوب", "price": 12 },
+    { "id": "te10", "category": "Tea", "name": "Iced Peach Tea", "nameAr": "شاي خوخ مثلج", "unit": "1 cup", "unitAr": "كوب", "price": 13 }
+  ],
+  "eventPackages": [
+    { "id": "ev01", "name": "Shisha Corner", "nameAr": "ركن الشيشة", "desc": "4 Arabic hookahs, 8 flavors, charcoal and a host, for 3 hours", "descAr": "4 شيش عربية و8 نكهات مع الفحم ومضيف لمدة 3 ساعات", "guests": "Up to 30 guests", "guestsAr": "حتى 30 ضيفًا", "price": 1200 },
+    { "id": "ev02", "name": "Tea & Karak Station", "nameAr": "ركن الشاي والكرك", "desc": "Karak, Adeni, red tea with mint and saffron tea, served by a barista", "descAr": "كرك وعدني وشاي أحمر بالنعناع وشاي بالزعفران يقدمها باريستا", "guests": "Up to 50 guests", "guestsAr": "حتى 50 ضيفًا", "price": 900 },
+    { "id": "ev03", "name": "Cheesecake Dessert Table", "nameAr": "طاولة تشيز كيك", "desc": "40 assorted fruit cheesecake slices with table styling", "descAr": "40 شريحة تشيز كيك بالفواكه المشكلة مع تنسيق الطاولة", "guests": "Up to 40 guests", "guestsAr": "حتى 40 ضيفًا", "price": 850 },
+    { "id": "ev04", "name": "Full Lounge Package", "nameAr": "باقة اللاونج الكاملة", "desc": "Shisha corner, tea station and dessert table, with setup and two hosts", "descAr": "ركن الشيشة وركن الشاي وطاولة الحلى مع التجهيز ومضيفَين", "guests": "Up to 50 guests", "guestsAr": "حتى 50 ضيفًا", "price": 2900, "was": 3300 }
+  ]
+}

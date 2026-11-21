@@ -24,10 +24,11 @@
     </button>
     <label class="search" for="search">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-      <input id="search" type="search" data-i18n-ph="searchPh" placeholder="Search groceries, electronics, home…" autocomplete="off">
+      <input id="search" type="search" data-i18n-ph="searchPh" placeholder="Search cheesecake, shisha, tea…" autocomplete="off">
     </label>
     <nav class="nav" aria-label="Main">
       <a href="#shop" data-route="shop" data-i18n="navShop">Shop</a>
+      <a href="#events" data-route="events" data-i18n="navEvents">Events</a>
       <a href="#orders" data-route="orders" data-i18n="navOrders">My orders</a>
       <a href="#admin" data-route="admin" data-i18n="navAdmin">Admin</a>
     </nav>
@@ -43,6 +44,7 @@
 
 <main>
   <section id="view-shop" class="view"></section>
+  <section id="view-events" class="view" hidden></section>
   <section id="view-orders" class="view" hidden></section>
   <section id="view-admin" class="view" hidden>
     <div class="admin" id="adminShell">
@@ -94,6 +96,8 @@
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
 <script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>

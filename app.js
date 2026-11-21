@@ -1,15 +1,23 @@
 'use strict';
 
 /* =====================================================================
-   WIns Delivery
-   Customer location -> zone (point in polygon) -> covering store -> catalog
+   WIns Lounge Delivery
+   Customer location -> zone (point in polygon) -> covering store -> menu
+   Data lives in Supabase (see supabase/migrations). Orders go through the
+   place_order() function, which re-checks zone, store, stock and prices.
    Bilingual: English / Arabic (RTL). Strings live in i18n.js.
    ===================================================================== */
 
 const BRAND = { name: 'WIns', logoUrl: 'assets/wins-logo.png' };
-const KEY = 'wins.delivery.v2'; // v2: Riyadh demo data, SAR
+const LOCAL_KEY = 'wins.local.v3';     // cart, location, my order tokens
 const LANG_KEY = 'wins.lang';
 const MAP_CENTER = [24.77, 46.66];
+const TZ = 'Asia/Riyadh';
+
+/* ---------------- Supabase ---------------- */
+const db = window.supabase.createClient(window.WINS_CONFIG.supabaseUrl, window.WINS_CONFIG.supabaseKey, {
+  auth: { persistSession: true, autoRefreshToken: true },
+});
 
 /* ---------------- language ---------------- */
 let lang = (() => { try { return localStorage.getItem(LANG_KEY); } catch (e) { return null; } })()
@@ -22,6 +30,7 @@ function t(key, vars) {
 }
 // Localized field: nm(product) → nameAr in Arabic when present, else name
 const nm = (o, f = 'name') => (o ? (lang === 'ar' && o[f + 'Ar']) || o[f] || '' : '');
+const pick = (en, ar) => (lang === 'ar' && ar ? ar : en || '');
 // Keep numbers, ranges and coordinates left-to-right inside Arabic text
 const ltr = s => `<bdi dir="ltr">${s}</bdi>`;
 
@@ -34,13 +43,19 @@ const fmt = n => Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 })
 const money = n => (lang === 'ar' ? `${fmt(n)} ${t('currency')}` : `${t('currency')} ${fmt(n)}`);
 const clone = o => JSON.parse(JSON.stringify(o));
 const pad = n => String(n).padStart(2, '0');
-const catLabel = c => t('cat_' + c);
+const normPhone = s => String(s || '').replace(/[^0-9+]/g, '');
+const validPhone = s => /^\+?[0-9]{9,15}$/.test(normPhone(s));
 
 function toast(msg) {
   const el = $('#toast');
   el.textContent = msg; el.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => (el.hidden = true), 2600);
+  toast.timer = setTimeout(() => (el.hidden = true), 3000);
+}
+// Map a Supabase/Postgres error to a friendly message.
+function errText(e) {
+  const key = String(e?.message || '').split(':')[0].trim();
+  return I18N.en['err_' + key] ? t('err_' + key) : t('err_generic');
 }
 
 /* ---------------- geometry ---------------- */
@@ -72,143 +87,118 @@ function km(a, b) {
 const kmStr = d => t('km', { d: d.toFixed(1) });
 const coords = p => ltr(`${p.lat.toFixed(4)}, ${p.lng.toFixed(4)}`);
 
-/* ---------------- catalog visuals ---------------- */
-const CAT = {
-  Fresh:       { hue: '#2E9E5B', icon: '<path d="M5 19c0-8 6-14 14-14 0 8-6 14-14 14Z"/><path d="M5 19l8-8"/>' },
-  Pantry:      { hue: '#C07A1A', icon: '<rect x="6" y="8" width="12" height="12" rx="2"/><path d="M8 4h8v4H8z"/><path d="M9 13h6"/>' },
-  Beverages:   { hue: '#2F6FB0', icon: '<path d="M7 4h10l-1.5 16h-7Z"/><path d="M7.5 9h9"/>' },
-  Electronics: { hue: '#5B4BB7', icon: '<path d="M13 3 5 14h6l-1 7 8-11h-6Z"/>' },
-  Home:        { hue: '#8A5A44', icon: '<path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/><path d="M10 20v-5h4v5"/>' },
-  Beauty:      { hue: '#B8457A', icon: '<path d="M12 3c3 5 6 8 6 11a6 6 0 0 1-12 0c0-3 3-6 6-11Z"/>' },
-};
-const catIcon = c => `<svg viewBox="0 0 24 24" aria-hidden="true">${(CAT[c] || CAT.Pantry).icon}</svg>`;
-const tileStyle = c => { const h = (CAT[c] || CAT.Pantry).hue; return `background:color-mix(in srgb, ${h} 15%, var(--surface));color:${h}`; };
-// Product photos (generated in Figma). Each photo is used only on the products it shows;
-// everything else keeps its category icon tile.
-const PHOTOS = {
-  p01: 'fresh', p02: 'fresh', p06: 'pantry', p09: 'pantry', p13: 'beverages',
-  p15: 'electronics', p16: 'electronics', p20: 'home', p21: 'home', p22: 'beauty', p23: 'beauty',
-};
-const thumb = p => PHOTOS[p.id]
-  ? `<img src="assets/products/${PHOTOS[p.id]}.jpg" alt="" loading="lazy" decoding="async">`
-  : catIcon(p.category);
-const thumbClass = p => (PHOTOS[p.id] ? ' has-photo' : '');
+/* ---------------- state ---------------- */
+// S: shared data from Supabase. LS: this device's own state.
+let S = { zones: [], stores: [], categories: [], products: [], inventory: {}, events: [] };
+const LS = (() => {
+  const base = { cart: {}, customer: null, orders: [], orderCache: {}, lastCustomer: {} };
+  try { return Object.assign(base, JSON.parse(localStorage.getItem(LOCAL_KEY) || '{}')); } catch (e) { return base; }
+})();
+function saveLocal() { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(LS)); } catch (e) { /* storage blocked */ } }
 
-/* ---------------- demo data (Riyadh) ---------------- */
-function seed() {
-  const Z = (id, code, name, nameAr, color, fee, minOrder, poly) => ({ id, code, name, nameAr, color, fee, minOrder, active: true, poly });
-  const zones = [
-    Z('z_oly', 'OLY-01', 'Al Olaya', 'العليا', '#0A7A55', 9, 50, [[24.7150, 46.6700], [24.7120, 46.6990], [24.6900, 46.7020], [24.6750, 46.6950], [24.6780, 46.6700], [24.6980, 46.6660]]),
-    Z('z_sul', 'SUL-02', 'Al Sulimaniyah', 'السليمانية', '#2F6FB0', 9, 50, [[24.7200, 46.7020], [24.7180, 46.7250], [24.6950, 46.7280], [24.6900, 46.7040]]),
-    Z('z_nak', 'NAK-03', 'Al Nakheel', 'النخيل', '#B8457A', 12, 60, [[24.7650, 46.6250], [24.7620, 46.6600], [24.7350, 46.6620], [24.7300, 46.6300], [24.7480, 46.6180]]),
-    Z('z_mlq', 'MLQ-04', 'Al Malqa', 'الملقا', '#C07A1A', 12, 60, [[24.8300, 46.5900], [24.8280, 46.6340], [24.7980, 46.6350], [24.7950, 46.5950]]),
-    Z('z_ysm', 'YSM-05', 'Al Yasmin', 'الياسمين', '#5B4BB7', 12, 60, [[24.8500, 46.6360], [24.8480, 46.6700], [24.8200, 46.6720], [24.8150, 46.6380]]),
-    Z('z_nrj', 'NRJ-06', 'Al Narjis', 'النرجس', '#1F8A8A', 15, 75, [[24.8900, 46.6500], [24.8880, 46.7000], [24.8580, 46.7020], [24.8550, 46.6550]]),
-    Z('z_rwd', 'RWD-07', 'Al Rawdah', 'الروضة', '#8A5A44', 12, 60, [[24.7500, 46.7500], [24.7480, 46.7900], [24.7220, 46.7920], [24.7200, 46.7520]]),
-    Z('z_dir', 'DIR-08', 'Diriyah', 'الدرعية', '#A33A3A', 15, 75, [[24.7600, 46.5550], [24.7580, 46.5950], [24.7280, 46.5970], [24.7250, 46.5580]]),
-  ];
-  const cov = list => list.map(([zone, role]) => ({ zone, role }));
-  const St = (id, name, nameAr, lat, lng, coverage, open, close, prep) => ({ id, name, nameAr, lat, lng, coverage: cov(coverage), open, close, prep, active: true });
-  const stores = [
-    St('s_oly', 'WIns Olaya Hub', 'WIns العليا', 24.6950, 46.6850, [['z_oly', 'primary'], ['z_sul', 'primary'], ['z_nak', 'backup']], '00:00', '24:00', 12),
-    St('s_nak', 'WIns Al Nakheel', 'WIns النخيل', 24.7470, 46.6400, [['z_nak', 'primary'], ['z_oly', 'backup'], ['z_dir', 'backup']], '08:00', '02:00', 10),
-    St('s_mlq', 'WIns Al Malqa', 'WIns الملقا', 24.8120, 46.6120, [['z_mlq', 'primary'], ['z_ysm', 'backup']], '07:00', '01:00', 12),
-    St('s_ysm', 'WIns Al Yasmin', 'WIns الياسمين', 24.8320, 46.6520, [['z_ysm', 'primary'], ['z_nrj', 'backup'], ['z_mlq', 'backup']], '00:00', '24:00', 14),
-    St('s_nrj', 'WIns Al Narjis', 'WIns النرجس', 24.8720, 46.6750, [['z_nrj', 'primary']], '08:00', '24:00', 11),
-    St('s_rwd', 'WIns Al Rawdah', 'WIns الروضة', 24.7350, 46.7700, [['z_rwd', 'primary']], '08:00', '24:00', 13),
-    St('s_dir', 'WIns Diriyah', 'WIns الدرعية', 24.7420, 46.5750, [['z_dir', 'primary']], '09:00', '22:00', 15),
-  ];
-  const P = (id, name, nameAr, category, price, unit, unitAr, was) => ({ id, name, nameAr, category, price, unit, unitAr, was: was || null, listed: true });
-  const products = [
-    P('p01', 'Tomatoes', 'طماطم', 'Fresh', 6.5, '1 kg', '1 كجم'),
-    P('p02', 'Bananas', 'موز', 'Fresh', 7, '1 kg', '1 كجم'),
-    P('p03', 'Fresh Full Fat Milk', 'حليب طازج كامل الدسم', 'Fresh', 6.5, '1 L', '1 لتر'),
-    P('p04', 'Fresh Eggs', 'بيض طازج', 'Fresh', 23, '30 pcs', '30 حبة', 26),
-    P('p05', 'Chicken Breast Fillet', 'صدور دجاج فيليه', 'Fresh', 32, '1 kg', '1 كجم'),
-    P('p06', 'Basmati Rice', 'أرز بسمتي', 'Pantry', 45, '5 kg', '5 كجم'),
-    P('p07', 'Durum Wheat Pasta', 'مكرونة قمح صلب', 'Pantry', 4.5, '400 g', '400 جم'),
-    P('p08', 'Sunflower Oil', 'زيت دوار الشمس', 'Pantry', 22, '1.8 L', '1.8 لتر', 25),
-    P('p09', 'Sukkari Dates', 'تمر سكري', 'Pantry', 35, '1 kg', '1 كجم'),
-    P('p10', 'Sidr Honey', 'عسل سدر', 'Pantry', 95, '500 g', '500 جم'),
-    P('p11', 'Drinking Water', 'مياه شرب', 'Beverages', 9, '6 × 1.5 L', '6 × 1.5 لتر'),
-    P('p12', 'Orange Juice', 'عصير برتقال', 'Beverages', 9.5, '1 L', '1 لتر'),
-    P('p13', 'Arabic Coffee with Cardamom', 'قهوة عربية بالهيل', 'Beverages', 38, '250 g', '250 جم'),
-    P('p14', 'Black Tea', 'شاي أسود', 'Beverages', 18, '100 bags', '100 كيس'),
-    P('p15', 'Wireless Earbuds', 'سماعات لاسلكية', 'Electronics', 199, '1 pair', 'زوج', 249),
-    P('p16', 'Power Bank 20,000 mAh', 'باور بانك 20,000 مللي أمبير', 'Electronics', 129, '1 pc', 'حبة'),
-    P('p17', 'USB-C Fast Charger 35W', 'شاحن سريع USB-C بقدرة 35 واط', 'Electronics', 69, '1 pc', 'حبة'),
-    P('p18', 'Smart LED Bulb', 'لمبة LED ذكية', 'Electronics', 49, 'E27, 9W', 'E27، 9 واط'),
-    P('p19', 'Dishwashing Liquid', 'سائل غسيل الصحون', 'Home', 11, '1 L', '1 لتر'),
-    P('p20', 'Laundry Detergent', 'مسحوق غسيل', 'Home', 39, '3 kg', '3 كجم', 45),
-    P('p21', 'Kitchen Paper Towels', 'مناديل مطبخ', 'Home', 17, '6 rolls', '6 لفات'),
-    P('p22', 'Argan Oil Shampoo', 'شامبو بزيت الأرجان', 'Beauty', 21, '400 ml', '400 مل'),
-    P('p23', 'Sunscreen SPF 50', 'واقي شمس SPF 50', 'Beauty', 65, '50 ml', '50 مل'),
-    P('p24', 'Whitening Toothpaste', 'معجون أسنان للتبييض', 'Beauty', 14, '2 × 100 ml', '2 × 100 مل'),
-  ];
-  const inventory = {};
-  const bigStores = ['s_oly', 's_ysm', 's_rwd'];
-  stores.forEach((s, i) => {
-    inventory[s.id] = {};
-    products.forEach((p, j) => {
-      if (p.category === 'Electronics' && !bigStores.includes(s.id)) return; // not carried
-      const q = (i * 37 + j * 11 + 7) % 43;
-      inventory[s.id][p.id] = q < 3 ? 0 : q;
-    });
-  });
-  return { zones, stores, products, inventory, orders: [], cart: {}, customer: null, seq: 1040 };
-}
-
-// Older saved data has no Arabic fields: copy them in from the demo data by id.
-function migrate(d) {
-  const s = seed();
-  const fill = (arr, src) => arr.forEach(x => {
-    const o = src.find(y => y.id === x.id); if (!o) return;
-    ['nameAr', 'unitAr'].forEach(k => { if (x[k] == null && o[k] != null) x[k] = o[k]; });
-  });
-  fill(d.zones, s.zones); fill(d.stores, s.stores); fill(d.products, s.products);
-  return d;
-}
-function load() {
-  try { const raw = localStorage.getItem(KEY); if (raw) return migrate(JSON.parse(raw)); } catch (e) { /* storage blocked */ }
-  return seed();
-}
-function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage blocked */ } }
-
-let S = load();
 const ui = {
+  ready: false, loadError: null,
   route: 'shop', cat: 'All', q: '', whyOpen: false,
-  cartOpen: false, checkout: false,
+  cartOpen: false, checkout: false, placing: false,
   adminTab: 'overview', mapMode: 'test', testLoc: null,
   zoneEdit: null, storeEdit: null, armed: null, focus: null,
-  pendingLoc: null,
+  pendingLoc: null, eventPkg: null, eventSent: null, sendingEvent: false,
+  session: null, isAdmin: false, adminOrders: [], eventReqs: [], authMsg: '',
 };
+
+/* ---------------- catalog visuals ---------------- */
+const ICONS = {
+  Cheesecake: '<path d="M3 16 18 8l3 2v6Z"/><path d="M3 16v4h18v-4"/><path d="M3 18h18"/><circle cx="16.5" cy="6" r="1.6"/>',
+  Shisha: '<path d="M10 3h4"/><path d="M9.5 5h5l-.8 3h-3.4Z"/><path d="M12 8v4"/><path d="M8 17.5a4 4 0 0 0 8 0c0-2.2-1.8-4.5-4-4.5s-4 2.3-4 4.5Z"/><path d="M16 15c2.5 0 4 1.2 4 4.5"/>',
+  Tea: '<path d="M4 10h12v4a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5Z"/><path d="M16 11.5h1.5a2 2 0 0 1 0 4H16"/><path d="M8 3.5c0 1.5 1 1.5 1 3M12 3.5c0 1.5 1 1.5 1 3"/>',
+  _: '<circle cx="12" cy="12" r="7"/>',
+};
+const EVENT_ICON = '<path d="M4 9h16v11H4Z"/><path d="M8 3v4M16 3v4M4 13h16"/>';
+const catOf = key => S.categories.find(c => c.key === key);
+const catIcon = key => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[key] || ICONS._}</svg>`;
+const hueOf = key => catOf(key)?.hue || '#CC9F50';
+const tileStyle = key => { const h = hueOf(key); return `background:color-mix(in srgb, ${h} 15%, var(--surface));color:${h}`; };
+const catLabel = key => nm(catOf(key)) || key;
+const ageRestricted = key => !!catOf(key)?.ageRestricted;
+
+/* ---------------- data loading ---------------- */
+async function loadCatalog() {
+  const q = (table, order) => { let r = db.from(table).select('*'); if (order) r = r.order(order); return r; };
+  const res = await Promise.all([
+    q('zones', 'code'), q('stores', 'name'), q('store_coverage'), q('categories', 'sort'),
+    q('products', 'sort'), q('inventory'), q('event_packages', 'sort'),
+  ]);
+  const bad = res.find(r => r.error);
+  if (bad) throw bad.error;
+  const [zones, stores, cov, cats, prods, inv, evs] = res.map(r => r.data);
+  S.zones = zones.map(z => ({ id: z.id, code: z.code, name: z.name, nameAr: z.name_ar, color: z.color, fee: +z.fee, minOrder: +z.min_order, active: z.active, poly: z.poly }));
+  S.stores = stores.map(s => ({
+    id: s.id, name: s.name, nameAr: s.name_ar, lat: s.lat, lng: s.lng, open: s.open_time, close: s.close_time,
+    prep: s.prep_minutes, active: s.active,
+    coverage: cov.filter(c => c.store_id === s.id).map(c => ({ zone: c.zone_id, role: c.role })),
+  }));
+  S.categories = cats.map(c => ({ key: c.key, name: c.name, nameAr: c.name_ar, hue: c.hue, ageRestricted: c.age_restricted }));
+  S.products = prods.map(p => ({ id: p.id, category: p.category, name: p.name, nameAr: p.name_ar, unit: p.unit, unitAr: p.unit_ar, price: +p.price, was: p.was == null ? null : +p.was, listed: p.listed, sort: p.sort }));
+  S.inventory = {};
+  inv.forEach(i => { (S.inventory[i.store_id] = S.inventory[i.store_id] || {})[i.product_id] = i.qty; });
+  S.events = evs.map(e => ({ id: e.id, name: e.name, nameAr: e.name_ar, desc: e.description, descAr: e.description_ar, guests: e.guests, guestsAr: e.guests_ar, price: +e.price, was: e.was == null ? null : +e.was, active: e.active }));
+  // Drop cart lines for products that no longer exist.
+  Object.keys(LS.cart).forEach(id => { if (!S.products.some(p => p.id === id)) delete LS.cart[id]; });
+}
+
+async function loadAdminData() {
+  if (!ui.isAdmin) return;
+  const [o, e] = await Promise.all([
+    db.from('orders').select('*, order_items(*)').order('created_at', { ascending: false }).limit(100),
+    db.from('event_requests').select('*').order('created_at', { ascending: false }).limit(200),
+  ]);
+  if (o.error) throw o.error;
+  if (e.error) throw e.error;
+  ui.adminOrders = o.data;
+  ui.eventReqs = e.data;
+}
+
+async function refreshAll() {
+  try {
+    await loadCatalog();
+    await loadAdminData();
+    ui.ready = true; ui.loadError = null;
+  } catch (err) {
+    ui.loadError = err;
+    console.error(err);
+  }
+  renderAll();
+}
 
 /* ---------------- store selection engine ---------------- */
 const toMin = v => { const [h, m] = String(v).split(':').map(Number); return h * 60 + (m || 0); };
-function isOpen(store, d = new Date()) {
-  const o = toMin(store.open), c = toMin(store.close), now = d.getHours() * 60 + d.getMinutes();
+function riyadhMinutes() {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const get = type => +parts.find(p => p.type === type).value;
+  return get('hour') * 60 + get('minute');
+}
+// Same rule as the database: hours are Saudi time, overnight hours (08:00 → 02:00) allowed.
+function isOpen(store) {
+  const o = toMin(store.open), c = toMin(store.close), now = riyadhMinutes();
   if (c - o >= 1440 || o === c) return true;
-  return c > o ? now >= o && now < c : now >= o || now < c; // overnight hours like 08:00 → 02:00
+  return c > o ? now >= o && now < c : now >= o || now < c;
 }
 const hours = s => ltr(`${s.open}–${s.close}`);
 const roleRank = r => (r === 'primary' ? 0 : 1);
 
-/**
- * Resolve which zone(s) a point is in and which store should serve it.
- * Ranking: available stores first → primary coverage before backup → nearest.
- */
+/** Which zone(s) contain a point and which store serves it: available → primary → nearest. */
 function resolve(loc) {
   if (!loc) return null;
   const zones = S.zones
     .filter(z => z.active !== false && z.poly.length >= 3 && pointInPolygon(loc.lat, loc.lng, z.poly))
-    .sort((a, b) => areaKm2(a.poly) - areaKm2(b.poly)); // smallest (most specific) zone first
+    .sort((a, b) => areaKm2(a.poly) - areaKm2(b.poly));
   const candidates = [];
   for (const st of S.stores) {
     const covs = st.coverage.filter(c => zones.some(z => z.id === c.zone)).sort((a, b) => roleRank(a.role) - roleRank(b.role));
     if (!covs.length) continue;
     const best = covs[0];
     const zone = zones.find(z => z.id === best.zone);
-    const reasons = []; // HTML-safe strings
+    const reasons = [];
     if (!st.active) reasons.push(esc(t('paused')));
     if (!isOpen(st)) reasons.push(t('closedHours', { h: hours(st) }));
     candidates.push({ store: st, zone, role: best.role, dist: km(loc, st), ok: reasons.length === 0, reasons });
@@ -224,12 +214,11 @@ function resolve(loc) {
   return { loc, zones, candidates, pick: candidates.find(c => c.ok) || null, nearest };
 }
 function eta(c) {
-  const ride = Math.round(c.dist * 3.2 + 4);
-  const lo = c.store.prep + ride;
+  const lo = c.store.prep + Math.round(c.dist * 3.2 + 4);
   return [lo, lo + 10];
 }
 const etaStr = ([lo, hi]) => t('minutes', { r: ltr(`${lo}–${hi}`) });
-const current = () => resolve(S.customer);
+const current = () => resolve(LS.customer);
 const stockOf = (storeId, pid) => S.inventory[storeId]?.[pid];
 
 /* ---------------- quick places ---------------- */
@@ -242,8 +231,7 @@ function placeName(c) {
   if (!c) return '';
   if (c.sample != null && SAMPLES[c.sample]) return SAMPLES[c.sample][lang === 'ar' ? 1 : 0];
   if (c.kind === 'gps') return t('currentLoc');
-  if (c.kind === 'pin') return t('pinned');
-  return c.label || t('pinned');
+  return t('pinned');
 }
 
 /* ---------------- static text & brand ---------------- */
@@ -259,23 +247,27 @@ function applyStatic() {
   lb.title = lang === 'ar' ? 'Switch to English' : 'التبديل إلى العربية';
 }
 function renderBrand() {
-  const el = $('#brand');
-  el.innerHTML = BRAND.logoUrl
-    ? `<img class="brand-img" src="${esc(BRAND.logoUrl)}" alt="${esc(BRAND.name)}">`
-    : `<span class="brand-word">${esc(BRAND.name)}</span>`;
+  $('#brand').innerHTML = `<img class="brand-img" src="${esc(BRAND.logoUrl)}" alt="${esc(BRAND.name)}">`;
 }
 
 /* ---------------- header ---------------- */
 function renderHeader() {
-  const res = current();
   let label = t('setLocation');
-  if (S.customer) {
-    const z = res?.zones[0], l = placeName(S.customer);
+  if (LS.customer && ui.ready) {
+    const z = current()?.zones[0], l = placeName(LS.customer);
     label = z ? (l === nm(z) ? nm(z) : `${nm(z)} · ${l}`) : t('outsideSuffix', { l });
   }
   $('#locLabel').textContent = label;
-  $('#cartCount').textContent = Object.values(S.cart).reduce((a, b) => a + b, 0);
+  $('#cartCount').textContent = Object.values(LS.cart).reduce((a, b) => a + b, 0);
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.route === ui.route));
+}
+
+/* ---------------- shared states ---------------- */
+function loadingState() {
+  if (ui.loadError) {
+    return `<div class="empty"><h2>${t('loadFail')}</h2><button class="btn btn-brand" data-action="retry">${t('retry')}</button></div>`;
+  }
+  return `<div class="empty loading"><span class="spinner" aria-hidden="true"></span><p>${t('loading')}</p></div>`;
 }
 
 /* ---------------- shop ---------------- */
@@ -289,16 +281,18 @@ function whyList(res) {
       ${c.reasons.length ? `<span class="why-reason">${c.reasons.join(' · ')}</span>` : ''}
     </li>`).join('')}</ol>`;
 }
-
 const zoneTag = (z, full = true) => `<span class="zone-tag"><i style="background:${esc(z.color)}"></i><span class="mono">${esc(z.code)}</span>${full ? ` · ${esc(nm(z))}` : ''}</span>`;
 
 function dispatchBanner(res) {
-  if (!S.customer) {
-    return `<div class="empty">
-      <span class="eyebrow">${t('step1')}</span>
-      <h1>${t('tellUs')}</h1>
-      <p>${t('tellUsP')}</p>
-      <div class="row"><button class="btn btn-brand" data-action="use-gps-direct">${t('detect')}</button><button class="btn" data-action="open-loc">${t('chooseMap')}</button></div>
+  if (!LS.customer) {
+    return `<div class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">${t('step1')}</span>
+        <h1>${t('tellUs')}</h1>
+        <p>${t('tellUsP')}</p>
+        <div class="row"><button class="btn btn-brand" data-action="use-gps-direct">${t('detect')}</button><button class="btn" data-action="open-loc">${t('chooseMap')}</button></div>
+      </div>
+      <div class="hero-art" aria-hidden="true">${['Cheesecake', 'Shisha', 'Tea'].map(k => `<span style="${tileStyle(k)}">${catIcon(k)}</span>`).join('')}</div>
     </div>`;
   }
   if (!res.zones.length) {
@@ -306,7 +300,7 @@ function dispatchBanner(res) {
     return `<div class="empty">
       <span class="eyebrow">${t('outside')}</span>
       <h1>${t('noDeliverH')}</h1>
-      <p>${t('noDeliverP', { c: `<span class="mono">${coords(S.customer)}</span>` })}
+      <p>${t('noDeliverP', { c: `<span class="mono">${coords(LS.customer)}</span>` })}
       ${n ? t('closestP', { z: `<b>${esc(nm(n.zone))}</b>`, d: ltr(n.dist.toFixed(1)) }) : ''}</p>
       <div class="row"><button class="btn btn-brand" data-action="open-loc">${t('changeLoc')}</button></div>
     </div>`;
@@ -347,7 +341,7 @@ function dispatchBanner(res) {
   </div>`;
 }
 
-const priceHtml = (p) => {
+const priceHtml = p => {
   const cur = `<small>${t('currency')}</small>`;
   const num = fmt(p.price);
   const was = p.was ? ` <s class="muted small">${fmt(p.was)}</s>` : '';
@@ -356,38 +350,41 @@ const priceHtml = (p) => {
 
 function productCard(p, storeId) {
   const stock = stockOf(storeId, p.id) || 0;
-  const qty = S.cart[p.id] || 0;
+  const qty = LS.cart[p.id] || 0;
   const out = stock <= 0;
   const badge = out ? `<span class="badge badge-muted">${t('outOfStock')}</span>`
     : p.was ? `<span class="badge">${ltr('−' + Math.round((1 - p.price / p.was) * 100) + '%')}</span>`
     : stock <= 5 ? `<span class="badge badge-muted">${t('onlyLeft', { n: stock })}</span>` : '';
+  const age = ageRestricted(p.category) ? `<span class="badge badge-age">${t('ageBadge')}</span>` : '';
   const ctrl = out ? `<button class="add-btn" disabled>${t('soldOut')}</button>`
     : qty ? `<div class="stepper"><button data-action="dec" data-id="${p.id}" aria-label="${t('removeOne')}">−</button><span>${qty}</span><button data-action="inc" data-id="${p.id}" aria-label="${t('addOne')}">+</button></div>`
     : `<button class="add-btn" data-action="inc" data-id="${p.id}">${t('add')}</button>`;
   return `<article class="card ${out ? 'is-out' : ''}">
-    <div class="tile${thumbClass(p)}" style="${tileStyle(p.category)}">${badge}${thumb(p)}</div>
+    <div class="tile" style="${tileStyle(p.category)}">${badge}${age}${catIcon(p.category)}</div>
     <div class="card-body"><span class="name">${esc(nm(p))}</span><span class="unit">${esc(nm(p, 'unit'))}</span></div>
     <div class="card-foot">${priceHtml(p)}${ctrl}</div>
   </article>`;
 }
 
 function renderShop() {
-  const res = current();
   const el = $('#view-shop');
+  if (!ui.ready) { el.innerHTML = loadingState(); return; }
+  const res = current();
   let html = dispatchBanner(res);
   const store = res?.pick?.store;
   if (store) {
     const q = ui.q.trim().toLowerCase();
     const carried = S.products.filter(p => p.listed !== false && stockOf(store.id, p.id) !== undefined);
-    const cats = ['All', ...Object.keys(CAT).filter(c => carried.some(p => p.category === c))];
+    const cats = ['All', ...S.categories.map(c => c.key).filter(k => carried.some(p => p.category === k))];
     if (!cats.includes(ui.cat)) ui.cat = 'All';
-    const hay = p => [p.name, p.nameAr, p.category, I18N.ar['cat_' + p.category]].join(' ').toLowerCase();
+    const hay = p => { const c = catOf(p.category) || {}; return [p.name, p.nameAr, c.name, c.nameAr].join(' ').toLowerCase(); };
     const list = carried.filter(p => (ui.cat === 'All' || p.category === ui.cat) && (!q || hay(p).includes(q)));
-    list.sort((a, b) => ((stockOf(store.id, b.id) > 0) - (stockOf(store.id, a.id) > 0)));
+    list.sort((a, b) => ((stockOf(store.id, b.id) > 0) - (stockOf(store.id, a.id) > 0)) || a.sort - b.sort);
     html += `<div class="catalog-head">
-      <div><span class="eyebrow">${t('inStockAt', { s: esc(nm(store)) })}</span><h2>${ui.cat === 'All' ? t('everything') : catLabel(ui.cat)}${q ? ` ${t('matching', { q: esc(ui.q) })}` : ''}</h2></div>
+      <div><span class="eyebrow">${t('inStockAt', { s: esc(nm(store)) })}</span><h2>${ui.cat === 'All' ? t('everything') : esc(catLabel(ui.cat))}${q ? ` ${t('matching', { q: esc(ui.q) })}` : ''}</h2></div>
+      <a class="btn btn-ghost btn-sm" href="#events"><svg viewBox="0 0 24 24" aria-hidden="true">${EVENT_ICON}</svg>${t('navEvents')}</a>
     </div>
-    <div class="chips" role="tablist">${cats.map(c => `<button class="chip ${c === ui.cat ? 'active' : ''}" data-action="cat" data-cat="${c}">${c === 'All' ? '' : catIcon(c)}${c === 'All' ? t('all') : catLabel(c)}<span class="count">${c === 'All' ? carried.length : carried.filter(p => p.category === c).length}</span></button>`).join('')}</div>
+    <div class="chips" role="tablist">${cats.map(c => `<button class="chip ${c === ui.cat ? 'active' : ''}" data-action="cat" data-cat="${esc(c)}">${c === 'All' ? '' : catIcon(c)}${c === 'All' ? t('all') : esc(catLabel(c))}<span class="count">${c === 'All' ? carried.length : carried.filter(p => p.category === c).length}</span></button>`).join('')}</div>
     <div style="height:14px"></div>
     ${list.length ? `<div class="grid-products">${list.map(p => productCard(p, store.id)).join('')}</div>`
       : `<div class="empty"><h3>${t('noProducts')}</h3><p>${t('noProductsP')}</p></div>`}`;
@@ -397,7 +394,7 @@ function renderShop() {
 
 /* ---------------- cart ---------------- */
 function cartLines(storeId) {
-  return Object.entries(S.cart).map(([pid, qty]) => {
+  return Object.entries(LS.cart).map(([pid, qty]) => {
     const p = S.products.find(x => x.id === pid);
     if (!p) return null;
     const stock = storeId ? stockOf(storeId, pid) || 0 : 0;
@@ -411,14 +408,15 @@ function cartTotals(res) {
   const sub = ok.reduce((s, l) => s + l.p.price * l.qty, 0);
   const zone = res?.pick?.zone;
   const fee = zone && sub > 0 ? zone.fee : 0;
-  return { lines, ok, sub, fee, total: sub + fee, zone, store, min: zone?.minOrder || 0 };
+  const needsAge = ok.some(l => ageRestricted(l.p.category));
+  return { lines, ok, sub, fee, total: sub + fee, zone, store, min: zone?.minOrder || 0, needsAge };
 }
 
 function renderCart() {
   const d = $('#drawer');
   if (!ui.cartOpen) { d.hidden = true; $('#scrim').hidden = true; return; }
   d.hidden = false; $('#scrim').hidden = false;
-  const res = current();
+  const res = ui.ready ? current() : null;
   const tt = cartTotals(res);
   const head = `<div class="drawer-head"><h2>${ui.checkout ? t('checkout') : t('yourCart')}</h2><button class="icon-btn" data-action="close-cart" aria-label="${t('close')}"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>`;
 
@@ -442,7 +440,7 @@ function renderCart() {
       ${from}
       ${unavailable.length ? `<div class="notice">${t('unavailableN', { n: unavailable.length })}</div>` : ''}
       ${tt.lines.map(l => `<div class="line-item ${l.available ? '' : 'unavailable'}">
-        <div class="mini${thumbClass(l.p)}" style="${tileStyle(l.p.category)}">${thumb(l.p)}</div>
+        <div class="mini" style="${tileStyle(l.p.category)}">${catIcon(l.p.category)}</div>
         <div><b>${esc(nm(l.p))}</b><div class="muted small">${esc(nm(l.p, 'unit'))} · ${money(l.p.price)}${l.available ? '' : ` · <span style="color:var(--danger)">${l.stock ? t('onlyNInStock', { n: l.stock }) : t('notHere')}</span>`}</div></div>
         <div class="stepper"><button data-action="dec" data-id="${l.p.id}" aria-label="${t('removeOne')}">−</button><span>${l.qty}</span><button data-action="inc" data-id="${l.p.id}" aria-label="${t('addOne')}">+</button></div>
       </div>`).join('')}
@@ -455,79 +453,172 @@ function renderCart() {
     return;
   }
 
-  const last = S.lastCustomer || {};
+  const last = LS.lastCustomer || {};
   d.innerHTML = head + `<form class="drawer-body" id="checkoutForm" autocomplete="on">
       ${from}
       <div class="notice" style="background:var(--brand-soft)">${t('arrivesIn', { e: etaStr(eta(res.pick)) })}</div>
-      <label class="field"><span>${t('fullName')}</span><input id="coName" name="name" required value="${esc(last.name || '')}"></label>
+      <label class="field"><span>${t('fullName')}</span><input id="coName" name="name" required minlength="2" maxlength="80" value="${esc(last.name || '')}"></label>
       <label class="field"><span>${t('mobile')}</span><input id="coPhone" name="phone" type="tel" dir="ltr" required placeholder="05x xxx xxxx" value="${esc(last.phone || '')}"></label>
       <div class="grid-3">
-        <label class="field"><span>${t('building')}</span><input id="coBldg" name="building" required value="${esc(last.building || '')}"></label>
-        <label class="field"><span>${t('floor')}</span><input id="coFloor" name="floor" value="${esc(last.floor || '')}"></label>
-        <label class="field"><span>${t('apt')}</span><input id="coApt" name="apt" value="${esc(last.apt || '')}"></label>
+        <label class="field"><span>${t('building')}</span><input id="coBldg" name="building" required maxlength="40" value="${esc(last.building || '')}"></label>
+        <label class="field"><span>${t('floor')}</span><input id="coFloor" name="floor" maxlength="20" value="${esc(last.floor || '')}"></label>
+        <label class="field"><span>${t('apt')}</span><input id="coApt" name="apt" maxlength="20" value="${esc(last.apt || '')}"></label>
       </div>
-      <label class="field"><span>${t('street')}</span><input id="coStreet" name="street" required value="${esc(last.street || '')}"></label>
-      <label class="field"><span>${t('note')}</span><textarea id="coNote" name="note"></textarea></label>
+      <label class="field"><span>${t('street')}</span><input id="coStreet" name="street" required maxlength="160" value="${esc(last.street || '')}"></label>
+      <label class="field"><span>${t('note')}</span><textarea id="coNote" name="note" maxlength="500"></textarea></label>
       <div class="field"><span>${t('payment')}</span>
         <label class="pay-opt"><input type="radio" name="pay" value="cash" checked> ${t('cod')}</label>
         <label class="pay-opt"><input type="radio" name="pay" value="card-on-delivery"> ${t('cardPos')}</label>
       </div>
+      ${tt.needsAge ? `<label class="age-row"><input id="coAge" type="checkbox" name="age" required> <span>${t('ageConfirm')}</span></label>` : ''}
       ${totals}
     </form>
     <div class="drawer-foot">
-      <button class="btn btn-brand btn-block" type="submit" form="checkoutForm">${t('placeOrder', { t: money(tt.total) })}</button>
+      <button class="btn btn-brand btn-block" type="submit" form="checkoutForm" ${ui.placing ? 'disabled' : ''}>${ui.placing ? t('placing') : t('placeOrder', { t: money(tt.total) })}</button>
       <button class="btn btn-ghost btn-block" data-action="back-cart">${t('backCart')}</button>
     </div>`;
 }
 
-function placeOrder(form) {
+async function placeOrder(form) {
+  if (ui.placing) return;
   const res = current();
   const tt = cartTotals(res);
   if (!tt.store || !tt.ok.length || tt.sub < tt.min) { toast(t('cantOrder')); return; }
   const f = Object.fromEntries(new FormData(form));
-  S.lastCustomer = { name: f.name, phone: f.phone, building: f.building, floor: f.floor, apt: f.apt, street: f.street };
-  const order = {
-    id: 'WN-' + (++S.seq), at: Date.now(), status: 0,
-    storeId: tt.store.id, storeName: tt.store.name, storeNameAr: tt.store.nameAr,
-    zoneId: tt.zone.id, zoneCode: tt.zone.code, zoneName: tt.zone.name, zoneNameAr: tt.zone.nameAr,
-    loc: { ...S.customer }, customer: f, pay: f.pay,
-    items: tt.ok.map(l => ({ pid: l.p.id, name: l.p.name, nameAr: l.p.nameAr, unit: l.p.unit, unitAr: l.p.unitAr, category: l.p.category, price: l.p.price, qty: l.qty })),
-    sub: tt.sub, fee: tt.fee, total: tt.total, eta: eta(res.pick),
+  if (!validPhone(f.phone)) { toast(t('err_invalid_phone')); $('#coPhone')?.focus(); return; }
+  if (tt.needsAge && !f.age) { toast(t('err_age_confirmation_required')); return; }
+  LS.lastCustomer = { name: f.name, phone: f.phone, building: f.building, floor: f.floor, apt: f.apt, street: f.street };
+  saveLocal();
+
+  ui.placing = true; renderCart();
+  const { data, error } = await db.rpc('place_order', {
+    p_lat: LS.customer.lat, p_lng: LS.customer.lng,
+    p_items: tt.ok.map(l => ({ id: l.p.id, qty: l.qty })),
+    p_customer: { name: f.name, phone: normPhone(f.phone), building: f.building, floor: f.floor, apt: f.apt, street: f.street, note: f.note },
+    p_pay: f.pay, p_age_confirmed: !!f.age,
+  });
+  ui.placing = false;
+  if (error) {
+    toast(errText(error));
+    if (/stock|unavailable/.test(error.message)) { await loadCatalog().catch(() => {}); renderAll(); } else renderCart();
+    return;
+  }
+  LS.orders.unshift({ code: data.code, token: data.token });
+  LS.orderCache[data.code] = {
+    ...data, status: 0, pay: f.pay,
+    items: tt.ok.map(l => ({ name: l.p.name, name_ar: l.p.nameAr, qty: l.qty })),
   };
-  order.items.forEach(i => { S.inventory[tt.store.id][i.pid] = Math.max(0, (S.inventory[tt.store.id][i.pid] || 0) - i.qty); });
-  S.orders.unshift(order);
-  S.cart = {};
+  LS.cart = {};
+  saveLocal();
   ui.checkout = false; ui.cartOpen = false;
-  save();
-  toast(t('orderPlaced', { id: order.id, s: nm(order, 'storeName') }));
+  toast(t('orderPlaced', { id: data.code, s: pick(data.store, data.store_ar) }));
+  await loadCatalog().catch(() => {});   // stock changed
   location.hash = '#orders';
   renderAll();
 }
 
 /* ---------------- orders ---------------- */
+// One card for both the customer's tracked orders (get_order shape) and the admin list.
 function orderCard(o, admin = false) {
-  const when = new Date(o.at);
+  const when = new Date(o.created_at);
   const date = when.toLocaleDateString(lang === 'ar' ? 'ar-SA-u-ca-gregory-nu-latn' : 'en-GB', { day: 'numeric', month: 'short' });
   const count = o.items.reduce((s, i) => s + i.qty, 0);
+  const time = when.toLocaleTimeString('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit' });
   return `<article class="order">
     <div class="order-head">
-      <div><span class="eyebrow">${date} · ${ltr(`${pad(when.getHours())}:${pad(when.getMinutes())}`)}</span>
-        <h3 class="mono" style="font-size:15px">${esc(o.id)}</h3>
-        <div class="muted small">${esc(nm(o, 'storeName'))} ${lang === 'ar' ? '←' : '→'} ${esc(nm(o, 'zoneName'))} <span class="mono">(${esc(o.zoneCode)})</span>${admin ? ` · ${esc(o.customer.name)} · <span class="mono">${esc(o.customer.phone)}</span>` : ''}</div>
+      <div><span class="eyebrow">${date} · ${ltr(time)}</span>
+        <h3 class="mono" style="font-size:15px">${esc(o.code)}</h3>
+        <div class="muted small">${esc(pick(o.store, o.store_ar))} ${lang === 'ar' ? '←' : '→'} ${esc(pick(o.zone, o.zone_ar))} <span class="mono">(${esc(o.zone_code)})</span></div>
+        ${admin ? `<div class="small">${esc(o.customer_name)} · <span class="mono">${esc(o.phone)}</span> · ${esc([o.building, o.floor, o.apt, o.street].filter(Boolean).join(', '))}${o.note ? ` · <i>${esc(o.note)}</i>` : ''}${o.age_confirmed ? ` · <span class="badge badge-age">${t('ageBadge')}</span>` : ''}</div>` : ''}
       </div>
       <div class="order-total"><div class="price">${money(o.total)}</div><div class="muted small">${t('itemsCount', { n: count })} · ${o.pay === 'cash' ? t('cashOD') : t('cardOD')}</div></div>
     </div>
     <div class="track">${[0, 1, 2, 3].map(i => `<div class="${i < o.status || o.status === 3 ? 'done' : i === o.status ? 'done now' : ''}">${t('status' + i)}</div>`).join('')}</div>
-    <div class="muted small">${o.items.map(i => `${i.qty}× ${esc(nm(i))}`).join(' · ')}</div>
-    ${admin && o.status < 3 ? `<div><button class="btn btn-sm btn-brand" data-action="order-advance" data-id="${o.id}">${t('markAs', { s: t('status' + (o.status + 1)) })}</button></div>` : ''}
+    <div class="muted small">${o.items.map(i => `${i.qty}× ${esc(pick(i.name, i.name_ar))}`).join(' · ')}</div>
+    ${admin && o.status < 3 ? `<div><button class="btn btn-sm btn-brand" data-action="order-advance" data-id="${o.id}" data-status="${o.status}">${t('markAs', { s: t('status' + (o.status + 1)) })}</button></div>` : ''}
   </article>`;
 }
+
+async function refreshMyOrders() {
+  await Promise.all(LS.orders.slice(0, 20).map(async ({ code, token }) => {
+    const { data, error } = await db.rpc('get_order', { p_code: code, p_token: token });
+    if (!error && data) LS.orderCache[code] = data;
+  }));
+  saveLocal();
+  if (ui.route === 'orders') renderOrders();
+}
+
 function renderOrders() {
+  const mine = LS.orders.map(o => LS.orderCache[o.code]).filter(Boolean);
   $('#view-orders').innerHTML = `<div class="stack" style="max-width:860px">
-    <div><span class="eyebrow">${t('yourOrders')}</span><h1>${t('trackH')}</h1></div>
-    ${S.orders.length ? `<div class="orders">${S.orders.map(o => orderCard(o)).join('')}</div>`
+    <div class="section-head"><div><span class="eyebrow">${t('yourOrders')}</span><h1>${t('trackH')}</h1></div>
+      ${mine.length ? `<button class="btn btn-sm" data-action="refresh-orders">${t('refresh')}</button>` : ''}</div>
+    ${mine.length ? `<div class="orders">${mine.map(o => orderCard(o)).join('')}</div>`
       : `<div class="empty"><h3>${t('noOrders')}</h3><p>${t('noOrdersP')}</p><a class="btn btn-brand" href="#shop">${t('startShopping')}</a></div>`}
   </div>`;
+}
+
+/* ---------------- events ---------------- */
+function renderEvents() {
+  const el = $('#view-events');
+  if (!ui.ready) { el.innerHTML = loadingState(); return; }
+  const pkgs = S.events.filter(e => e.active !== false);
+  const sel = ui.eventPkg || pkgs[0]?.id;
+  const today = new Date().toISOString().slice(0, 10);
+  const last = LS.lastCustomer || {};
+  el.innerHTML = `<div class="stack">
+    <div class="events-hero">
+      <span class="eyebrow">${t('eventsEyebrow')}</span>
+      <h1>${t('eventsH')}</h1>
+      <p class="muted">${t('eventsP')}</p>
+    </div>
+    <div class="events-grid">${pkgs.map(e => `<article class="pkg ${e.id === sel ? 'selected' : ''}">
+      <div class="pkg-art">${e.id === 'ev01' ? `<span style="${tileStyle('Shisha')}">${catIcon('Shisha')}</span>`
+        : e.id === 'ev02' ? `<span style="${tileStyle('Tea')}">${catIcon('Tea')}</span>`
+        : e.id === 'ev03' ? `<span style="${tileStyle('Cheesecake')}">${catIcon('Cheesecake')}</span>`
+        : ['Shisha', 'Tea', 'Cheesecake'].map(k => `<span style="${tileStyle(k)}">${catIcon(k)}</span>`).join('')}</div>
+      <h3>${esc(nm(e))}</h3>
+      <p class="muted small">${esc(nm(e, 'desc'))}</p>
+      <div class="pkg-foot">
+        <div><div class="price">${money(e.price)}${e.was ? ` <s class="muted small">${fmt(e.was)}</s>` : ''}</div><div class="muted small">${esc(nm(e, 'guests'))}</div></div>
+        <button class="btn btn-sm ${e.id === sel ? 'btn-brand' : ''}" data-action="pick-pkg" data-id="${e.id}">${t('requestBooking')}</button>
+      </div>
+    </article>`).join('')}</div>
+    <form class="form-card booking" id="eventForm" autocomplete="on">
+      <h2>${t('bookingForm')}</h2>
+      ${ui.eventSent ? `<div class="notice" style="background:var(--brand-soft)">${esc(t('requestSent', { p: ui.eventSent }))}</div>` : ''}
+      <div class="grid-2">
+        <label class="field"><span>${t('package')}</span><select id="evPkg" name="package">${pkgs.map(e => `<option value="${e.id}" ${e.id === sel ? 'selected' : ''}>${esc(nm(e))} · ${money(e.price)}</option>`).join('')}</select></label>
+        <label class="field"><span>${t('eventDate')}</span><input id="evDate" name="date" type="date" required min="${today}"></label>
+      </div>
+      <div class="grid-2">
+        <label class="field"><span>${t('fullName')}</span><input id="evName" name="name" required minlength="2" maxlength="80" value="${esc(last.name || '')}"></label>
+        <label class="field"><span>${t('mobile')}</span><input id="evPhone" name="phone" type="tel" dir="ltr" required placeholder="05x xxx xxxx" value="${esc(last.phone || '')}"></label>
+      </div>
+      <div class="grid-2">
+        <label class="field"><span>${t('guestsN')}</span><input id="evGuests" name="guests" type="number" min="1" max="2000" required value="30"></label>
+        <label class="field"><span>${t('district')}</span><input id="evDistrict" name="district" maxlength="80" placeholder="${esc(lang === 'ar' ? 'العليا' : 'Al Olaya')}"></label>
+      </div>
+      <label class="field"><span>${t('notesOpt')}</span><textarea id="evNotes" name="notes" maxlength="1000"></textarea></label>
+      <button class="btn btn-brand" type="submit" ${ui.sendingEvent ? 'disabled' : ''}>${ui.sendingEvent ? t('sending') : t('sendRequest')}</button>
+    </form>
+  </div>`;
+}
+
+async function sendEventRequest(form) {
+  const f = Object.fromEntries(new FormData(form));
+  if (!validPhone(f.phone)) { toast(t('err_invalid_phone')); $('#evPhone')?.focus(); return; }
+  ui.sendingEvent = true; renderEvents();
+  const { error } = await db.from('event_requests').insert({
+    package_id: f.package, name: f.name.trim(), phone: normPhone(f.phone), event_date: f.date,
+    guests: Math.round(+f.guests), district: f.district.trim() || null, notes: f.notes.trim() || null,
+  });
+  ui.sendingEvent = false;
+  if (error) { toast(errText(error)); renderEvents(); return; }
+  LS.lastCustomer = { ...LS.lastCustomer, name: f.name, phone: f.phone }; saveLocal();
+  ui.eventSent = f.phone;
+  renderEvents();
+  $('#eventForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 /* ---------------- maps ---------------- */
@@ -555,6 +646,10 @@ function drawZones(layer, { highlight = [], labels = true, dim = null } = {}) {
     if (labels) pg.bindTooltip(`${z.code}`, { permanent: true, direction: 'center', className: 'zone-label' });
   });
 }
+function fitAll(map) {
+  const pts = S.zones.flatMap(z => z.poly);
+  if (pts.length) map.fitBounds(L.latLngBounds(pts), { padding: [20, 20] });
+}
 
 /* ---------- location picker ---------- */
 let locMap, locLayers;
@@ -563,7 +658,7 @@ function renderSamples() {
 }
 function openLoc() {
   $('#locModal').hidden = false;
-  ui.pendingLoc = S.customer ? { ...S.customer } : null;
+  ui.pendingLoc = LS.customer ? { ...LS.customer } : null;
   renderSamples();
   if (!locMap) {
     locMap = baseMap($('#locMap'));
@@ -600,10 +695,6 @@ function updateLocModal(fly) {
   }
 }
 function closeLoc() { $('#locModal').hidden = true; }
-function fitAll(map) {
-  const pts = S.zones.flatMap(z => z.poly);
-  if (pts.length) map.fitBounds(L.latLngBounds(pts), { padding: [20, 20] });
-}
 
 function detectLocation(onDone) {
   const status = $('#gpsStatus');
@@ -617,11 +708,38 @@ function detectLocation(onDone) {
 }
 function setCustomer(loc) {
   const before = current()?.pick?.store.id;
-  S.customer = loc; save();
+  LS.customer = loc; saveLocal();
   const after = current();
   if (after?.pick && before && after.pick.store.id !== before) toast(t('toastSwitched', { s: nm(after.pick.store) }));
   else if (after?.pick) toast(t('toastFrom', { s: nm(after.pick.store) }));
   renderAll();
+}
+
+/* ---------------- admin: auth ---------------- */
+async function checkAdmin(session) {
+  ui.session = session;
+  ui.isAdmin = false;
+  if (session?.user) {
+    const { data } = await db.from('admins').select('user_id').eq('user_id', session.user.id).maybeSingle();
+    ui.isAdmin = !!data;
+  }
+}
+
+function adminLogin() {
+  const user = ui.session?.user;
+  return `<div class="login-card">
+    <img src="${esc(BRAND.logoUrl)}" alt="" class="login-logo">
+    <h2>${t('adminSignIn')}</h2>
+    <p class="muted">${t('adminSignInP')}</p>
+    ${ui.authMsg ? `<div class="notice">${esc(ui.authMsg)}</div>` : ''}
+    ${user ? `<div class="notice notice-danger">${esc(t('signedInAs', { e: user.email }))}. ${t('notAdmin')}</div>
+      <button class="btn" data-action="sign-out">${t('signOut')}</button>`
+    : `<form id="loginForm" class="stack">
+      <label class="field"><span>${t('email')}</span><input id="lgEmail" name="email" type="email" dir="ltr" required autocomplete="username"></label>
+      <label class="field"><span>${t('password')}</span><input id="lgPass" name="password" type="password" dir="ltr" required minlength="8" autocomplete="current-password"></label>
+      <div class="row"><button class="btn btn-brand" type="submit">${t('signIn')}</button><button class="btn btn-ghost" type="button" data-action="sign-up">${t('signUp')}</button></div>
+    </form>`}
+  </div>`;
 }
 
 /* ---------------- admin ---------------- */
@@ -664,7 +782,6 @@ function redrawAdminMap() {
   if (ui.storeEdit) highlight = ui.storeEdit.coverage.map(c => c.zone);
   drawZones(A.zones, { highlight, dim: ui.zoneEdit?.id });
 
-  // lines from a store to the zones it covers (dashed = backup)
   A.links.clearLayers();
   const linkStore = ui.storeEdit || (ui.focus?.type === 'store' && S.stores.find(x => x.id === ui.focus.id));
   if (linkStore && linkStore.lat != null) {
@@ -703,23 +820,31 @@ function redrawAdminMap() {
 }
 
 function renderAdmin() {
-  const tabs = [['overview'], ['zones', S.zones.length], ['stores', S.stores.length], ['products', S.products.length], ['orders', S.orders.length]];
+  if (!ui.isAdmin) {
+    $('#adminTabs').innerHTML = '';
+    $('#adminShell').classList.add('wide');
+    $('#adminBody').innerHTML = adminLogin();
+    return;
+  }
+  const newEvents = ui.eventReqs.filter(e => e.status === 'new').length;
+  const tabs = [['overview'], ['zones', S.zones.length], ['stores', S.stores.length], ['products', S.products.length], ['orders', ui.adminOrders.filter(o => o.status < 3).length], ['events', newEvents]];
   $('#adminTabs').innerHTML = tabs.map(([id, n]) => `<button class="tab ${ui.adminTab === id ? 'active' : ''}" data-action="admin-tab" data-tab="${id}" role="tab">${t('tab_' + id)}${n != null ? `<span class="count">${n}</span>` : ''}</button>`).join('');
-  const wide = ui.adminTab === 'products' || ui.adminTab === 'orders';
+  const wide = ['products', 'orders', 'events'].includes(ui.adminTab);
   $('#adminShell').classList.toggle('wide', wide);
   renderAdminBody();
   if (!wide) { ensureAdminMap(); redrawAdminMap(); }
 }
 
 function renderAdminBody() {
-  const fn = { overview: adminOverview, zones: adminZones, stores: adminStores, products: adminProducts, orders: adminOrders }[ui.adminTab];
+  if (!ui.isAdmin) { $('#adminBody').innerHTML = adminLogin(); return; }
+  const fn = { overview: adminOverview, zones: adminZones, stores: adminStores, products: adminProducts, orders: adminOrders, events: adminEvents }[ui.adminTab];
   $('#adminBody').innerHTML = fn();
   if (ui.adminTab === 'zones' && ui.zoneEdit) updateDrawStatus();
 }
 
 function adminOverview() {
-  const today = new Date().toDateString();
-  const todays = S.orders.filter(o => new Date(o.at).toDateString() === today);
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+  const todays = ui.adminOrders.filter(o => new Date(o.created_at).toLocaleDateString('en-CA', { timeZone: TZ }) === todayStr);
   const openNow = S.stores.filter(s => s.active && isOpen(s)).length;
   const covered = S.zones.filter(z => S.stores.some(s => s.coverage.some(c => c.zone === z.id && c.role === 'primary'))).length;
   const test = ui.testLoc ? resolve(ui.testLoc) : null;
@@ -732,21 +857,20 @@ function adminOverview() {
       <div class="row"><button class="btn btn-sm" data-action="test-as-customer">${t('shopFromHere')}</button><button class="btn btn-sm btn-ghost" data-action="test-clear">${t('clear')}</button></div>
     </div>`;
   }
-  return `<div><span class="eyebrow">${t('operations')}</span><h2>${t('networkOverview')}</h2></div>
+  return `<div class="section-head"><div><span class="eyebrow">${t('operations')}</span><h2>${t('networkOverview')}</h2></div>
+      <span class="pill pill-ok">${t('liveData')}</span></div>
     <div class="kpis">
       <div class="kpi"><b>${S.zones.length}</b><span>${t('kpiZones', { n: covered })}</span></div>
       <div class="kpi"><b>${ltr(`${openNow}/${S.stores.length}`)}</b><span>${t('kpiOpen')}</span></div>
       <div class="kpi"><b>${todays.length}</b><span>${t('kpiOrders')}</span></div>
-      <div class="kpi"><b class="num">${fmt(todays.reduce((s, o) => s + o.total, 0))}</b><span>${t('kpiRevenue', { c: t('currency') })}</span></div>
+      <div class="kpi"><b class="num">${fmt(todays.reduce((s, o) => s + +o.total, 0))}</b><span>${t('kpiRevenue', { c: t('currency') })}</span></div>
     </div>
     <div class="form-card"><div class="section-head"><h3>${t('tester')}</h3></div>${testHtml}</div>
     <div class="form-card">
       <h3>${t('howChosen')}</h3>
-      <ol class="small muted how">
-        <li>${t('how1')}</li><li>${t('how2')}</li><li>${t('how3')}</li><li>${t('how4')}</li>
-      </ol>
+      <ol class="small muted how"><li>${t('how1')}</li><li>${t('how2')}</li><li>${t('how3')}</li><li>${t('how4')}</li></ol>
     </div>
-    <div class="row"><button class="btn btn-sm btn-danger ${ui.armed === 'reset' ? 'armed' : ''}" data-action="reset-demo">${ui.armed === 'reset' ? t('resetConfirm') : t('resetDemo')}</button></div>`;
+    <div class="row small muted">${esc(t('signedInAs', { e: ui.session?.user?.email || '' }))} · <button class="link-btn" data-action="sign-out">${t('signOut')}</button></div>`;
 }
 
 /* ----- zones ----- */
@@ -757,11 +881,11 @@ function adminZones() {
       <div class="form-card">
         <div class="draw-status" id="drawStatus"></div>
         <div class="grid-2">
-          <label class="field"><span>${t('nameEn')}</span><input id="zName" dir="ltr" data-zf="name" value="${esc(z.name)}" placeholder="Sheraton"></label>
-          <label class="field"><span>${t('nameAr')}</span><input id="zNameAr" dir="rtl" lang="ar" data-zf="nameAr" value="${esc(z.nameAr || '')}" placeholder="شيراتون"></label>
+          <label class="field"><span>${t('nameEn')}</span><input id="zName" dir="ltr" data-zf="name" value="${esc(z.name)}" placeholder="Al Wurud"></label>
+          <label class="field"><span>${t('nameAr')}</span><input id="zNameAr" dir="rtl" lang="ar" data-zf="nameAr" value="${esc(z.nameAr || '')}" placeholder="الورود"></label>
         </div>
         <div class="grid-2">
-          <label class="field"><span>${t('code')}</span><input id="zCode" dir="ltr" data-zf="code" value="${esc(z.code)}" placeholder="SHR-09"></label>
+          <label class="field"><span>${t('code')}</span><input id="zCode" dir="ltr" data-zf="code" value="${esc(z.code)}" placeholder="WRD-09"></label>
           <label class="field"><span>${t('mapColor')}</span><input id="zColor" type="color" data-zf="color" value="${esc(z.color)}"></label>
         </div>
         <div class="grid-2">
@@ -807,8 +931,8 @@ function adminStores() {
     return `<div class="section-head"><h2>${S.stores.some(x => x.id === s.id) ? t('editStore') : t('newStore')}</h2></div>
       <div class="form-card">
         <div class="grid-2">
-          <label class="field"><span>${t('nameEn')}</span><input id="sName" dir="ltr" data-sf="name" value="${esc(s.name)}" placeholder="WIns Dokki"></label>
-          <label class="field"><span>${t('nameAr')}</span><input id="sNameAr" dir="rtl" lang="ar" data-sf="nameAr" value="${esc(s.nameAr || '')}" placeholder="WIns الدقي"></label>
+          <label class="field"><span>${t('nameEn')}</span><input id="sName" dir="ltr" data-sf="name" value="${esc(s.name)}" placeholder="WIns Al Wurud"></label>
+          <label class="field"><span>${t('nameAr')}</span><input id="sNameAr" dir="rtl" lang="ar" data-sf="nameAr" value="${esc(s.nameAr || '')}" placeholder="WIns الورود"></label>
         </div>
         <div class="field"><span>${t('location')}</span>
           <div class="row">
@@ -819,7 +943,7 @@ function adminStores() {
         <div class="grid-3">
           <label class="field"><span>${t('opens')}</span><input id="sOpen" type="time" data-sf="open" value="${esc(s.open)}"></label>
           <label class="field"><span>${t('closes')}</span><input id="sClose" type="time" data-sf="close" value="${esc(s.close === '24:00' ? '23:59' : s.close)}"></label>
-          <label class="field"><span>${t('prep')}</span><input id="sPrep" type="number" min="1" data-sf="prep" value="${s.prep}"></label>
+          <label class="field"><span>${t('prep')}</span><input id="sPrep" type="number" min="1" max="240" data-sf="prep" value="${s.prep}"></label>
         </div>
         <label class="row small"><input id="sActive" type="checkbox" data-sf="active" ${s.active ? 'checked' : ''}> ${t('accepting')}</label>
         <div class="field"><span>${t('covering')}</span>
@@ -858,14 +982,14 @@ function adminProducts() {
     <form class="form-card" id="newProduct">
       <h3>${t('addProduct')}</h3>
       <div class="grid-2">
-        <label class="field"><span>${t('nameEn')}</span><input id="npName" name="name" dir="ltr" required placeholder="Greek Yogurt"></label>
-        <label class="field"><span>${t('nameAr')}</span><input id="npNameAr" name="nameAr" dir="rtl" lang="ar" placeholder="زبادي يوناني"></label>
+        <label class="field"><span>${t('nameEn')}</span><input id="npName" name="name" dir="ltr" required maxlength="120" placeholder="Lotus Cheesecake"></label>
+        <label class="field"><span>${t('nameAr')}</span><input id="npNameAr" name="nameAr" dir="rtl" lang="ar" maxlength="120" placeholder="تشيز كيك لوتس"></label>
       </div>
       <div class="grid-3" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))">
-        <label class="field"><span>${t('category')}</span><select id="npCat" name="category">${Object.keys(CAT).map(c => `<option value="${c}">${catLabel(c)}</option>`).join('')}</select></label>
+        <label class="field"><span>${t('category')}</span><select id="npCat" name="category">${S.categories.map(c => `<option value="${esc(c.key)}">${esc(nm(c))}</option>`).join('')}</select></label>
         <label class="field"><span>${t('priceC', { c: t('currency') })}</span><input id="npPrice" name="price" type="number" min="0" step="0.5" required></label>
-        <label class="field"><span>${t('unit')}</span><input id="npUnit" name="unit" dir="ltr" placeholder="500 g"></label>
-        <label class="field"><span>${t('unitAr')}</span><input id="npUnitAr" name="unitAr" dir="rtl" lang="ar" placeholder="500 جم"></label>
+        <label class="field"><span>${t('unit')}</span><input id="npUnit" name="unit" dir="ltr" maxlength="60" placeholder="1 slice"></label>
+        <label class="field"><span>${t('unitAr')}</span><input id="npUnitAr" name="unitAr" dir="rtl" lang="ar" maxlength="60" placeholder="شريحة"></label>
       </div>
       <div class="row"><label class="field" style="flex:1"><span>${t('startStock')}</span><input id="npStock" name="stock" type="number" min="0" value="20"></label><button class="btn btn-brand" type="submit" style="align-self:end">${t('addProductBtn')}</button></div>
     </form>
@@ -873,7 +997,7 @@ function adminProducts() {
     <div class="table-wrap"><table>
       <thead><tr><th>${t('product')}</th><th>${t('listed')}</th><th class="n">${t('price')}</th>${S.stores.map(s => `<th class="n" title="${esc(nm(s))}">${esc(shortStore(s))}</th>`).join('')}<th></th></tr></thead>
       <tbody>${S.products.map(p => `<tr>
-        <td><div class="prod-cell"><span class="mini${thumbClass(p)}" style="${tileStyle(p.category)}">${thumb(p)}</span><div><b>${esc(nm(p))}</b><div class="small muted">${catLabel(p.category)} · ${esc(nm(p, 'unit'))}</div></div></div></td>
+        <td><div class="prod-cell"><span class="mini" style="${tileStyle(p.category)}">${catIcon(p.category)}</span><div><b>${esc(nm(p))}</b><div class="small muted">${esc(catLabel(p.category))} · ${esc(nm(p, 'unit'))}</div></div></div></td>
         <td><input type="checkbox" data-listed="${p.id}" ${p.listed !== false ? 'checked' : ''} aria-label="${t('listed')}"></td>
         <td class="n"><input class="stock-in" type="number" min="0" step="0.5" data-price="${p.id}" value="${p.price}" aria-label="${t('price')}"></td>
         ${S.stores.map(s => { const q = stockOf(s.id, p.id); return `<td class="n"><input class="stock-in ${q === 0 ? 'zero' : q === undefined ? 'na' : ''}" type="number" min="0" placeholder="—" data-stock="${s.id}|${p.id}" value="${q ?? ''}" aria-label="${esc(t('stockAt', { s: nm(s) }))}"></td>`; }).join('')}
@@ -883,27 +1007,65 @@ function adminProducts() {
 }
 
 /* ----- orders ----- */
+const adminOrderShape = o => ({
+  ...o, store: o.store_name, store_ar: o.store_name_ar, zone: o.zone_name, zone_ar: o.zone_name_ar,
+  items: (o.order_items || []).map(i => ({ name: i.name, name_ar: i.name_ar, qty: i.qty })),
+});
 function adminOrders() {
-  const active = S.orders.filter(o => o.status < 3);
-  return `<div class="section-head"><div><span class="eyebrow">${t('dispatchEy')}</span><h2>${t('tab_orders')}</h2></div><span class="muted small">${t('inProgress', { n: active.length })}</span></div>
-    ${S.orders.length ? `<div class="orders" style="max-width:none">${S.orders.map(o => orderCard(o, true)).join('')}</div>`
+  const active = ui.adminOrders.filter(o => o.status < 3);
+  return `<div class="section-head"><div><span class="eyebrow">${t('dispatchEy')}</span><h2>${t('tab_orders')}</h2></div>
+      <span class="row"><span class="muted small">${t('inProgress', { n: active.length })}</span><button class="btn btn-sm" data-action="admin-refresh">${t('refresh')}</button></span></div>
+    ${ui.adminOrders.length ? `<div class="orders" style="max-width:none">${ui.adminOrders.map(o => orderCard(adminOrderShape(o), true)).join('')}</div>`
       : `<div class="empty"><h3>${t('noOrders')}</h3><p>${t('noOrdersAdminP')}</p></div>`}`;
 }
 
+/* ----- event requests ----- */
+function adminEvents() {
+  const statuses = ['new', 'contacted', 'confirmed', 'cancelled'];
+  return `<div class="section-head"><div><span class="eyebrow">${t('eventsEyebrow')}</span><h2>${t('tab_events')}</h2></div><button class="btn btn-sm" data-action="admin-refresh">${t('refresh')}</button></div>
+    ${ui.eventReqs.length ? `<div class="list">${ui.eventReqs.map(r => {
+      const pkg = S.events.find(e => e.id === r.package_id);
+      return `<div class="item event-req">
+        <span class="store-dot"><svg viewBox="0 0 24 24" aria-hidden="true">${EVENT_ICON}</svg></span>
+        <div><b>${esc(r.name)}</b> · <span class="mono">${esc(r.phone)}</span>
+          <div class="small muted">${esc(pkg ? nm(pkg) : '—')} · ${ltr(esc(r.event_date))} · ${t('guestsCount', { n: r.guests })}${r.district ? ' · ' + esc(r.district) : ''}</div>
+          ${r.notes ? `<div class="small">${esc(r.notes)}</div>` : ''}</div>
+        <span class="seg">${statuses.map(s => `<button type="button" class="${r.status === s ? 'on' : ''}" data-action="event-status" data-id="${r.id}" data-status="${s}">${t('evStatus_' + s)}</button>`).join('')}</span>
+      </div>`;
+    }).join('')}</div>` : `<div class="empty"><h3>${t('noEventReqs')}</h3></div>`}`;
+}
+
+/* ---------------- admin writes ---------------- */
+async function write(fn, { reload = true, quiet = false } = {}) {
+  try {
+    const results = [].concat(await fn());
+    const bad = results.find(r => r && r.error);
+    if (bad) throw bad.error;
+    if (!quiet) toast(t('savedOk'));
+    if (reload) { await loadCatalog(); await loadAdminData(); renderAll(); }
+    return true;
+  } catch (e) {
+    toast(t('saveFail', { m: e.message || e }));
+    return false;
+  }
+}
+
 /* ---------------- render ---------------- */
+const ROUTES = ['shop', 'events', 'orders', 'admin'];
 function renderAll() {
   renderHeader();
-  $('#view-shop').hidden = ui.route !== 'shop';
-  $('#view-orders').hidden = ui.route !== 'orders';
-  $('#view-admin').hidden = ui.route !== 'admin';
+  ROUTES.forEach(r => ($('#view-' + r).hidden = ui.route !== r));
   if (ui.route === 'shop') renderShop();
+  if (ui.route === 'events') renderEvents();
   if (ui.route === 'orders') renderOrders();
   if (ui.route === 'admin') renderAdmin();
   renderCart();
 }
 function route() {
   const r = location.hash.slice(1) || 'shop';
-  ui.route = ['shop', 'orders', 'admin'].includes(r) ? r : 'shop';
+  ui.route = ROUTES.includes(r) ? r : 'shop';
+  if (ui.route === 'orders') refreshMyOrders();
+  if (ui.route === 'events') ui.eventSent = null;
   renderAll();
   window.scrollTo(0, 0);
 }
@@ -913,17 +1075,16 @@ function setLang(next) {
   applyStatic();
   renderAll();
   if (!$('#locModal').hidden) { renderSamples(); updateLocModal(false); }
-  // Leaflet needs a size refresh after the page direction flips
   setTimeout(() => { locMap?.invalidateSize(); adminMap?.invalidateSize(); }, 30);
 }
 
 /* ---------------- events ---------------- */
 function setQty(pid, delta) {
   const store = current()?.pick?.store;
-  const next = (S.cart[pid] || 0) + delta;
+  const next = (LS.cart[pid] || 0) + delta;
   if (delta > 0 && store && next > (stockOf(store.id, pid) || 0)) { toast(t('maxStock')); return; }
-  if (next <= 0) delete S.cart[pid]; else S.cart[pid] = next;
-  save();
+  if (next <= 0) delete LS.cart[pid]; else LS.cart[pid] = next;
+  saveLocal();
   if (delta > 0) { const b = $('#cartBtn'); b.classList.remove('bump'); void b.offsetWidth; b.classList.add('bump'); }
   renderHeader();
   if (ui.route === 'shop') renderShop();
@@ -931,6 +1092,7 @@ function setQty(pid, delta) {
 }
 
 const actions = {
+  'retry': () => { ui.loadError = null; renderAll(); refreshAll(); },
   'toggle-lang': () => setLang(lang === 'ar' ? 'en' : 'ar'),
   'open-loc': () => openLoc(),
   'close-loc': () => closeLoc(),
@@ -946,38 +1108,50 @@ const actions = {
   'close-cart': () => { ui.cartOpen = false; ui.checkout = false; renderCart(); },
   'checkout': () => { ui.checkout = true; renderCart(); },
   'back-cart': () => { ui.checkout = false; renderCart(); },
-
-  'admin-tab': el => { ui.adminTab = el.dataset.tab; ui.zoneEdit = null; ui.storeEdit = null; ui.mapMode = 'test'; ui.focus = null; renderAdmin(); },
-  'test-clear': () => { ui.testLoc = null; renderAdmin(); },
-  'test-as-customer': () => { setCustomer({ ...ui.testLoc, kind: 'pin' }); location.hash = '#shop'; },
-  'reset-demo': () => {
-    if (ui.armed !== 'reset') { ui.armed = 'reset'; renderAdminBody(); return; }
-    S = seed(); ui.armed = null; ui.testLoc = null; save(); toast(t('restored')); renderAll();
+  'refresh-orders': () => refreshMyOrders(),
+  'pick-pkg': el => {
+    ui.eventPkg = el.dataset.id; ui.eventSent = null; renderEvents();
+    $('#eventForm')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   },
 
+  // admin auth
+  'sign-up': async () => {
+    const email = $('#lgEmail')?.value.trim(), password = $('#lgPass')?.value;
+    if (!email || !password || password.length < 8) { $('#loginForm')?.reportValidity(); return; }
+    const { error } = await db.auth.signUp({ email, password });
+    ui.authMsg = error ? t('authFail', { m: error.message }) : t('signUpDone');
+    renderAdminBody();
+  },
+  'sign-out': async () => { await db.auth.signOut(); ui.authMsg = ''; },
+
+  'admin-tab': el => { ui.adminTab = el.dataset.tab; ui.zoneEdit = null; ui.storeEdit = null; ui.mapMode = 'test'; ui.focus = null; renderAdmin(); },
+  'admin-refresh': async () => { await loadAdminData().catch(e => toast(t('saveFail', { m: e.message }))); renderAdmin(); },
+  'test-clear': () => { ui.testLoc = null; renderAdmin(); },
+  'test-as-customer': () => { setCustomer({ ...ui.testLoc, kind: 'pin' }); location.hash = '#shop'; },
+
   'zone-new': () => {
-    ui.zoneEdit = { id: uid('z'), code: `ZN-${pad(S.zones.length + 1)}`, name: '', nameAr: '', color: '#CC9F50', fee: 20, minOrder: 120, active: true, poly: [] };
+    ui.zoneEdit = { id: uid('z'), code: `ZN-${pad(S.zones.length + 1)}`, name: '', nameAr: '', color: '#CC9F50', fee: 12, minOrder: 60, active: true, poly: [] };
     ui.mapMode = 'draw'; renderAdmin();
   },
   'zone-edit': el => { ui.zoneEdit = clone(S.zones.find(z => z.id === el.dataset.id)); ui.mapMode = 'draw'; renderAdmin(); adminMap.fitBounds(L.latLngBounds(ui.zoneEdit.poly), { padding: [60, 60] }); },
   'zone-undo': () => { ui.zoneEdit.poly.pop(); redrawAdminMap(); updateDrawStatus(); },
   'zone-clear': () => { ui.zoneEdit.poly = []; redrawAdminMap(); updateDrawStatus(); },
   'zone-cancel': () => { ui.zoneEdit = null; ui.mapMode = 'test'; renderAdmin(); },
-  'zone-save': () => {
+  'zone-save': async () => {
     const z = ui.zoneEdit;
     if (!z.name.trim() && !(z.nameAr || '').trim()) { toast(t('nameZone')); $('#zName')?.focus(); return; }
-    if (!z.name.trim()) z.name = z.nameAr;
     if (z.poly.length < 3) { toast(t('need3')); return; }
-    const i = S.zones.findIndex(x => x.id === z.id);
-    if (i >= 0) S.zones[i] = z; else S.zones.push(z);
-    ui.zoneEdit = null; ui.mapMode = 'test'; save(); toast(t('zoneSaved', { z: nm(z) })); renderAll();
+    const ok = await write(() => db.from('zones').upsert({
+      id: z.id, code: z.code.trim(), name: z.name.trim() || z.nameAr.trim(), name_ar: (z.nameAr || '').trim() || null,
+      color: z.color, fee: +z.fee || 0, min_order: +z.minOrder || 0, active: z.active !== false, poly: z.poly,
+    }));
+    if (ok) { ui.zoneEdit = null; ui.mapMode = 'test'; renderAdmin(); }
   },
-  'zone-del': el => {
+  'zone-del': async el => {
     const id = el.dataset.id;
     if (ui.armed !== 'z' + id) { ui.armed = 'z' + id; renderAdminBody(); return; }
-    S.zones = S.zones.filter(z => z.id !== id);
-    S.stores.forEach(s => (s.coverage = s.coverage.filter(c => c.zone !== id)));
-    ui.armed = null; save(); toast(t('zoneDeleted')); renderAll();
+    ui.armed = null;
+    await write(() => db.from('zones').delete().eq('id', id));
   },
 
   'store-new': () => {
@@ -994,40 +1168,44 @@ const actions = {
     renderAdminBody(); redrawAdminMap();
   },
   'store-cancel': () => { ui.storeEdit = null; ui.mapMode = 'test'; renderAdmin(); },
-  'store-save': () => {
+  'store-save': async () => {
     const s = ui.storeEdit;
     if (!s.name.trim() && !(s.nameAr || '').trim()) { toast(t('nameStore')); $('#sName')?.focus(); return; }
-    if (!s.name.trim()) s.name = s.nameAr;
     if (s.lat == null) { toast(t('pickStoreLoc')); return; }
-    if (s.close === '23:59') s.close = '24:00';
-    const i = S.stores.findIndex(x => x.id === s.id);
-    if (i >= 0) S.stores[i] = s;
-    else {
-      S.stores.push(s);
-      S.inventory[s.id] = {};
-      S.products.filter(p => p.category !== 'Electronics').forEach(p => (S.inventory[s.id][p.id] = 20));
-    }
-    ui.storeEdit = null; ui.mapMode = 'test'; save(); toast(t('saved', { s: nm(s) })); renderAll();
+    const isNew = !S.stores.some(x => x.id === s.id);
+    const ok = await write(async () => {
+      const r1 = await db.from('stores').upsert({
+        id: s.id, name: s.name.trim() || s.nameAr.trim(), name_ar: (s.nameAr || '').trim() || null, lat: s.lat, lng: s.lng,
+        open_time: s.open, close_time: s.close === '23:59' ? '24:00' : s.close, prep_minutes: Math.round(+s.prep) || 12, active: !!s.active,
+      });
+      if (r1.error) return r1;
+      const r2 = await db.from('store_coverage').delete().eq('store_id', s.id);
+      if (r2.error) return r2;
+      const r3 = s.coverage.length ? await db.from('store_coverage').insert(s.coverage.map(c => ({ store_id: s.id, zone_id: c.zone, role: c.role }))) : {};
+      if (r3.error || !isNew) return r3;
+      return db.from('inventory').insert(S.products.map(p => ({ store_id: s.id, product_id: p.id, qty: 20 })));
+    });
+    if (ok) { ui.storeEdit = null; ui.mapMode = 'test'; renderAdmin(); }
   },
-  'store-del': el => {
+  'store-del': async el => {
     const id = el.dataset.id;
     if (ui.armed !== 's' + id) { ui.armed = 's' + id; renderAdminBody(); return; }
-    S.stores = S.stores.filter(s => s.id !== id); delete S.inventory[id];
-    ui.armed = null; ui.focus = null; save(); toast(t('storeDeleted')); renderAll();
+    ui.armed = null; ui.focus = null;
+    await write(() => db.from('stores').delete().eq('id', id));
   },
-  'prod-del': el => {
+  'prod-del': async el => {
     const id = el.dataset.id;
     if (ui.armed !== 'p' + id) { ui.armed = 'p' + id; renderAdminBody(); return; }
-    S.products = S.products.filter(p => p.id !== id);
-    Object.values(S.inventory).forEach(inv => delete inv[id]);
-    delete S.cart[id];
-    ui.armed = null; save(); toast(t('productDeleted')); renderAll();
+    ui.armed = null;
+    delete LS.cart[id]; saveLocal();
+    await write(() => db.from('products').delete().eq('id', id));
   },
-  'order-advance': el => {
-    const o = S.orders.find(x => x.id === el.dataset.id);
-    if (!o) return;
-    if (o.status < 3) o.status++;
-    save(); toast(`${o.id}: ${t('status' + o.status)}`); renderAll();
+  'order-advance': async el => {
+    const next = +el.dataset.status + 1;
+    await write(() => db.from('orders').update({ status: next }).eq('id', el.dataset.id));
+  },
+  'event-status': async el => {
+    await write(() => db.from('event_requests').update({ status: el.dataset.status }).eq('id', el.dataset.id));
   },
 };
 
@@ -1035,9 +1213,8 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (!el) { if (ui.armed) { ui.armed = null; if (ui.route === 'admin') renderAdminBody(); } return; }
   const a = el.dataset.action;
-  // buttons inside a clickable store row shouldn't also trigger the row
   if (a === 'store-focus' && e.target.closest('button')) return;
-  if (!/^(zone-del|store-del|prod-del|reset-demo)$/.test(a) && ui.armed) ui.armed = null;
+  if (!/^(zone-del|store-del|prod-del)$/.test(a) && ui.armed) ui.armed = null;
   if (actions[a]) { e.preventDefault(); actions[a](el); }
 });
 
@@ -1049,33 +1226,60 @@ document.addEventListener('input', e => {
   if (el.dataset.sf && ui.storeEdit) ui.storeEdit[el.dataset.sf] = val;
 });
 
+// Inline edits in the products table save without re-rendering, so focus stays put.
 document.addEventListener('change', e => {
   const el = e.target;
+  if (el.id === 'evPkg') { ui.eventPkg = el.value; }
   if (el.dataset.stock) {
     const [sid, pid] = el.dataset.stock.split('|');
-    S.inventory[sid] = S.inventory[sid] || {};
-    if (el.value === '') delete S.inventory[sid][pid]; else S.inventory[sid][pid] = Math.max(0, Math.round(+el.value));
-    el.classList.toggle('zero', el.value !== '' && +el.value === 0);
-    el.classList.toggle('na', el.value === '');
-    save();
+    const blank = el.value === '';
+    const qty = Math.max(0, Math.round(+el.value));
+    write(() => blank
+      ? db.from('inventory').delete().eq('store_id', sid).eq('product_id', pid)
+      : db.from('inventory').upsert({ store_id: sid, product_id: pid, qty }), { reload: false })
+      .then(ok => {
+        if (!ok) return;
+        S.inventory[sid] = S.inventory[sid] || {};
+        if (blank) delete S.inventory[sid][pid]; else S.inventory[sid][pid] = qty;
+        el.classList.toggle('zero', !blank && qty === 0);
+        el.classList.toggle('na', blank);
+      });
   }
-  if (el.dataset.price) { const p = S.products.find(x => x.id === el.dataset.price); if (p && +el.value >= 0) { p.price = +el.value; save(); } }
-  if (el.dataset.listed) { const p = S.products.find(x => x.id === el.dataset.listed); if (p) { p.listed = el.checked; save(); } }
+  if (el.dataset.price && +el.value >= 0) {
+    const id = el.dataset.price, price = +el.value;
+    write(() => db.from('products').update({ price }).eq('id', id), { reload: false })
+      .then(ok => { if (ok) S.products.find(p => p.id === id).price = price; });
+  }
+  if (el.dataset.listed) {
+    const id = el.dataset.listed, listed = el.checked;
+    write(() => db.from('products').update({ listed }).eq('id', id), { reload: false })
+      .then(ok => { if (ok) S.products.find(p => p.id === id).listed = listed; });
+  }
 });
 
-document.addEventListener('submit', e => {
+document.addEventListener('submit', async e => {
   e.preventDefault();
-  if (e.target.id === 'checkoutForm') placeOrder(e.target);
-  if (e.target.id === 'newProduct') {
-    const f = Object.fromEntries(new FormData(e.target));
+  const f = e.target;
+  if (f.id === 'checkoutForm') placeOrder(f);
+  if (f.id === 'eventForm') sendEventRequest(f);
+  if (f.id === 'loginForm') {
+    const { email, password } = Object.fromEntries(new FormData(f));
+    const { error } = await db.auth.signInWithPassword({ email: email.trim(), password });
+    ui.authMsg = error ? t('authFail', { m: error.message }) : '';
+    if (error) renderAdminBody();
+  }
+  if (f.id === 'newProduct') {
+    const d = Object.fromEntries(new FormData(f));
     const id = uid('p');
-    const name = f.name.trim() || f.nameAr.trim();
-    S.products.unshift({
-      id, name, nameAr: f.nameAr.trim() || null, category: f.category, price: +f.price,
-      unit: f.unit.trim() || '1 pc', unitAr: f.unitAr.trim() || null, was: null, listed: true,
+    const ok = await write(async () => {
+      const r1 = await db.from('products').insert({
+        id, category: d.category, name: d.name.trim() || d.nameAr.trim(), name_ar: d.nameAr.trim() || null,
+        unit: d.unit.trim() || null, unit_ar: d.unitAr.trim() || null, price: +d.price, sort: S.products.length,
+      });
+      if (r1.error) return r1;
+      return db.from('inventory').insert(S.stores.map(s => ({ store_id: s.id, product_id: id, qty: Math.max(0, Math.round(+d.stock || 0)) })));
     });
-    S.stores.forEach(s => { (S.inventory[s.id] = S.inventory[s.id] || {})[id] = Math.max(0, +f.stock || 0); });
-    save(); toast(t('productAdded', { p: nm(S.products[0]) })); renderAdminBody();
+    if (ok) toast(t('productAdded', { p: d.nameAr && lang === 'ar' ? d.nameAr : d.name }));
   }
 });
 
@@ -1088,14 +1292,25 @@ document.addEventListener('keydown', e => {
 
 window.addEventListener('hashchange', route);
 
+db.auth.onAuthStateChange((event, session) => {
+  // Defer: Supabase recommends not awaiting other Supabase calls inside this callback.
+  setTimeout(async () => {
+    const wasAdmin = ui.isAdmin;
+    await checkAdmin(session);
+    if (ui.isAdmin !== wasAdmin) { await refreshAll(); } else if (ui.route === 'admin') renderAdmin();
+  }, 0);
+});
+
 /* ---------------- boot ---------------- */
 applyStatic();
 renderBrand();
 route();
-// Auto-detect on first visit; if that fails, let the customer choose on the map.
-if (!S.customer) {
-  detectLocation(loc => {
-    if (loc) setCustomer(loc);
-    else if (ui.route === 'shop') openLoc();
-  });
-}
+refreshAll().then(() => {
+  // Auto-detect on first visit; if that fails, let the customer choose on the map.
+  if (!LS.customer && ui.ready) {
+    detectLocation(loc => {
+      if (loc) setCustomer(loc);
+      else if (ui.route === 'shop') openLoc();
+    });
+  }
+});
